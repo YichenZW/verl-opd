@@ -101,7 +101,7 @@ def _gather_teacher_log_probs_on_student_topk(
         device=teacher_topk_log_probs.device,
     )
     non_match = torch.full_like(teacher_topk_log_probs.unsqueeze(-2), torch.finfo(teacher_topk_log_probs.dtype).min)
-    matched = torch.where(matches, teacher_topk_log_probs.clamp_min(missing_log_prob).unsqueeze(-2), non_match)
+    matched = torch.where(matches, teacher_topk_log_probs.unsqueeze(-2), non_match)
     has_match = matches.any(dim=-1)
     matched = matched.max(dim=-1).values
     return torch.where(has_match, matched, missing), has_match
@@ -237,11 +237,13 @@ def compute_reverse_kl_student_topk(
         teacher_topk_log_probs=teacher_topk_log_probs,
         missing_log_prob=loss_config.log_prob_min_clamp,
     )
-    student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
-    teacher_log_probs_on_student_topk = teacher_log_probs_on_student_topk.clamp_min(loss_config.log_prob_min_clamp)
 
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_log_probs_on_student_topk.exp().sum(dim=-1)
+
+    student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
+    teacher_log_probs_on_student_topk = teacher_log_probs_on_student_topk.clamp_min(loss_config.log_prob_min_clamp)
+
     distillation_losses = reverse_kl_divergence(log_q=student_topk_log_probs, log_p=teacher_log_probs_on_student_topk)
 
     overlap_count = overlap_mask.sum(dim=-1)
