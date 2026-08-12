@@ -239,7 +239,7 @@ def compute_reverse_kl_student_topk(
     )
 
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
-    teacher_mass = teacher_log_probs_on_student_topk.exp().sum(dim=-1)
+    teacher_mass = (teacher_log_probs_on_student_topk.exp() * overlap_mask).sum(dim=-1)
 
     student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
     teacher_log_probs_on_student_topk = teacher_log_probs_on_student_topk.clamp_min(loss_config.log_prob_min_clamp)

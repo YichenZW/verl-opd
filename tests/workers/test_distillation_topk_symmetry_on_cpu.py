@@ -274,3 +274,25 @@ def test_reverse_kl_student_topk_mass_uses_raw_logprobs_before_clamp():
     torch.testing.assert_close(output["teacher_mass"], expected_teacher_logprobs.exp().sum(dim=-1))
     assert output["student_mass"].item() < student_topk_logprobs.clamp_min(-10.0).exp().sum(dim=-1).item()
     assert output["teacher_mass"].item() < expected_teacher_logprobs.clamp_min(-10.0).exp().sum(dim=-1).item()
+
+
+def test_reverse_kl_student_topk_teacher_mass_ignores_missing_fallback():
+    logits = torch.tensor([[[20.0, 19.0, 0.0, -1.0]]], dtype=torch.float32)
+    teacher_ids = _nested_from_rows([[0, 2]]).to(torch.int64)
+    teacher_logprobs = _nested_from_rows([[-1.0e-6, -20.0]]).to(torch.float32)
+    config = SimpleNamespace(
+        distillation_loss=SimpleNamespace(topk=2, log_prob_min_clamp=-10.0, use_chunked_topk=False)
+    )
+
+    output = compute_fsdp_reverse_kl_student_topk(
+        student_logits=logits,
+        teacher_topk_log_probs=teacher_logprobs,
+        teacher_topk_ids=teacher_ids,
+        config=config,
+        data_format="thd",
+    )
+
+    fallback_mass = torch.tensor(config.distillation_loss.log_prob_min_clamp).exp()
+    torch.testing.assert_close(output["teacher_mass"], torch.exp(teacher_logprobs.values()[0, 0]).view(1, 1))
+    assert (output["teacher_mass"] + fallback_mass).item() > 1.0
+    assert output["overlap_count"].item() == 1
