@@ -31,6 +31,7 @@ of log-prob computation.
 """
 
 import os
+import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -44,6 +45,7 @@ from tensordict import TensorDict
 from verl.trainer.distillation.fsdp.losses import compute_forward_kl_topk as compute_fsdp_forward_kl_topk
 from verl.trainer.distillation.fsdp.losses import compute_reverse_kl_student_topk as compute_fsdp_reverse_kl_student_topk
 from verl.trainer.distillation.losses import compute_forward_kl_topk as collect_forward_kl_topk_metrics
+from verl.trainer.distillation.losses import compute_topk_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
@@ -249,6 +251,51 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
 
     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
+
+
+def test_megatron_reverse_kl_student_topk_dispatches_reverse_backend(monkeypatch):
+    calls = []
+
+    def _forward_backend(**kwargs):
+        calls.append("forward")
+        raise AssertionError("forward_kl_topk backend should not be selected")
+
+    def _reverse_backend(student_logits, **kwargs):
+        calls.append("reverse")
+        return {
+            "distillation_losses": torch.zeros(student_logits.shape[:2]),
+            "student_mass": torch.zeros(student_logits.shape[:2]),
+            "teacher_mass": torch.zeros(student_logits.shape[:2]),
+            "overlap_count": torch.zeros(student_logits.shape[:2]),
+            "overlap_token_advantage": torch.zeros(student_logits.shape[:2]),
+        }
+
+    fake_megatron_losses = SimpleNamespace(
+        compute_forward_kl_topk=_forward_backend,
+        compute_reverse_kl_student_topk=_reverse_backend,
+    )
+    fake_megatron_package = SimpleNamespace(losses=fake_megatron_losses)
+    monkeypatch.setitem(sys.modules, "verl.trainer.distillation.megatron", fake_megatron_package)
+    monkeypatch.setitem(sys.modules, "verl.trainer.distillation.megatron.losses", fake_megatron_losses)
+
+    student_logits = torch.zeros(1, 2, 4)
+    data = TensorDict(
+        {
+            "teacher_logprobs": torch.zeros(1, 2, 2),
+            "teacher_ids": torch.zeros(1, 2, 2, dtype=torch.long),
+        },
+        batch_size=[1, 2],
+    )
+    outputs = compute_topk_loss(
+        config=SimpleNamespace(strategy="megatron"),
+        distillation_config=SimpleNamespace(distillation_loss=SimpleNamespace(loss_mode="reverse_kl_student_topk")),
+        data=data,
+        student_logits=student_logits,
+        data_format="thd",
+    )
+
+    assert calls == ["reverse"]
+    assert outputs["distillation_losses"].shape == student_logits.shape[:2]
 
 
 def test_reverse_kl_student_topk_mass_uses_raw_logprobs_before_clamp():
