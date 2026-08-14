@@ -31,6 +31,7 @@ of log-prob computation.
 """
 
 import os
+import sys
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -41,10 +42,16 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from verl.experimental.teacher_loop.teacher_manager import _get_teacher_sampling_params
 from verl.trainer.distillation.fsdp.losses import compute_forward_kl_topk as compute_fsdp_forward_kl_topk
+from verl.trainer.distillation.fsdp.losses import (
+    compute_reverse_kl_topk as compute_fsdp_reverse_kl_topk,
+)
 from verl.trainer.distillation.losses import compute_forward_kl_topk as collect_forward_kl_topk_metrics
+from verl.trainer.distillation.losses import compute_topk_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.workers.config.distillation import DistillationTeacherModelConfig
 from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 
 _VOCAB_SIZE = 8
@@ -248,3 +255,133 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
 
     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
+
+
+def test_reverse_kl_topk_uses_student_topk_and_full_teacher_logprobs():
+    logits = torch.tensor([[[3.0, 1.0, 2.0, 0.0]]], dtype=torch.float32)
+    teacher_ids = _nested_from_rows([[2, 0, 3, 1]]).to(torch.int64)
+    teacher_logprobs = _nested_from_rows(
+        [
+            [
+                torch.log(torch.tensor(0.2)),
+                torch.log(torch.tensor(0.5)),
+                torch.log(torch.tensor(0.1)),
+                torch.log(torch.tensor(0.2)),
+            ]
+        ]
+    ).to(torch.float32)
+    config = SimpleNamespace(distillation_loss=SimpleNamespace(topk=2, log_prob_min_clamp=None, use_chunked_topk=False))
+
+    output = compute_fsdp_reverse_kl_topk(
+        student_logits=logits,
+        teacher_topk_log_probs=teacher_logprobs,
+        teacher_topk_ids=teacher_ids,
+        config=config,
+        data_format="thd",
+    )
+
+    student_log_probs = torch.log_softmax(logits, dim=-1)
+    student_topk_log_probs, student_topk_ids = torch.topk(student_log_probs, k=2, dim=-1)
+    dense_teacher_logprobs = torch.empty_like(student_log_probs)
+    dense_teacher_logprobs.scatter_(
+        dim=-1, index=teacher_ids.values().unsqueeze(0), src=teacher_logprobs.values().unsqueeze(0)
+    )
+    teacher_on_student_topk = torch.gather(dense_teacher_logprobs, dim=-1, index=student_topk_ids)
+    expected_loss = (student_topk_log_probs.exp() * (student_topk_log_probs - teacher_on_student_topk)).sum(dim=-1)
+
+    torch.testing.assert_close(output["distillation_losses"], expected_loss)
+    torch.testing.assert_close(output["student_mass"], student_topk_log_probs.exp().sum(dim=-1))
+    torch.testing.assert_close(output["teacher_mass"], teacher_on_student_topk.exp().sum(dim=-1))
+
+
+def test_reverse_kl_topk_requires_full_teacher_payload():
+    logits = torch.tensor([[[3.0, 1.0, 2.0, 0.0]]], dtype=torch.float32)
+    teacher_ids = _nested_from_rows([[0, 2]]).to(torch.int64)
+    teacher_logprobs = _nested_from_rows([[torch.log(torch.tensor(0.5)), torch.log(torch.tensor(0.2))]]).to(
+        torch.float32
+    )
+    config = SimpleNamespace(distillation_loss=SimpleNamespace(topk=2, log_prob_min_clamp=None, use_chunked_topk=False))
+
+    with pytest.raises(ValueError, match="full-vocab teacher log-prob payload"):
+        compute_fsdp_reverse_kl_topk(
+            student_logits=logits,
+            teacher_topk_log_probs=teacher_logprobs,
+            teacher_topk_ids=teacher_ids,
+            config=config,
+            data_format="thd",
+        )
+
+
+def test_reverse_kl_topk_teacher_sampling_requests_full_vocab():
+    teacher_config = SimpleNamespace(inference=SimpleNamespace(temperature=1.0), get_vocab_size=lambda: 7)
+    loss_config = SimpleNamespace(
+        loss_mode="reverse_kl_topk",
+        topk=2,
+        loss_settings=SimpleNamespace(use_topk=True),
+    )
+
+    sampling_params = _get_teacher_sampling_params(teacher_config, loss_config)
+
+    assert sampling_params["prompt_logprobs"] == 7
+
+
+def test_teacher_vocab_size_cache_is_mutable(monkeypatch):
+    calls = []
+
+    class _FakeAutoConfig:
+        vocab_size = 13
+
+    def _from_pretrained(model_path):
+        calls.append(model_path)
+        return _FakeAutoConfig()
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", _from_pretrained)
+
+    teacher_config = DistillationTeacherModelConfig(model_path="dummy-teacher")
+
+    assert teacher_config.get_vocab_size() == 13
+    assert teacher_config.get_vocab_size() == 13
+    assert calls == ["dummy-teacher"]
+
+
+def test_megatron_reverse_kl_topk_dispatches_named_backend(monkeypatch):
+    calls = []
+
+    def _forward_backend(**kwargs):
+        calls.append("forward")
+        raise AssertionError("forward_kl_topk backend should not be selected")
+
+    def _reverse_backend(student_logits, **kwargs):
+        calls.append("reverse")
+        return {
+            "distillation_losses": torch.zeros(student_logits.shape[:2]),
+            "student_mass": torch.zeros(student_logits.shape[:2]),
+            "teacher_mass": torch.zeros(student_logits.shape[:2]),
+        }
+
+    fake_megatron_losses = SimpleNamespace(
+        compute_forward_kl_topk=_forward_backend,
+        compute_reverse_kl_topk=_reverse_backend,
+    )
+    fake_megatron_package = SimpleNamespace(losses=fake_megatron_losses)
+    monkeypatch.setitem(sys.modules, "verl.trainer.distillation.megatron", fake_megatron_package)
+    monkeypatch.setitem(sys.modules, "verl.trainer.distillation.megatron.losses", fake_megatron_losses)
+
+    student_logits = torch.zeros(1, 2, 4)
+    data = TensorDict(
+        {
+            "teacher_logprobs": torch.zeros(1, 2, 4),
+            "teacher_ids": torch.arange(4, dtype=torch.long).view(1, 1, 4).expand(1, 2, 4),
+        },
+        batch_size=[1, 2],
+    )
+    outputs = compute_topk_loss(
+        config=SimpleNamespace(strategy="megatron"),
+        distillation_config=SimpleNamespace(distillation_loss=SimpleNamespace(loss_mode="reverse_kl_topk")),
+        data=data,
+        student_logits=student_logits,
+        data_format="thd",
+    )
+
+    assert calls == ["reverse"]
+    assert outputs["distillation_losses"].shape == student_logits.shape[:2]
