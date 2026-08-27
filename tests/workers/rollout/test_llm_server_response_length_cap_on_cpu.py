@@ -39,7 +39,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.workers.rollout import llm_server
-from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
 from verl.workers.rollout.replica import TokenOutput
 
 PROMPT_LENGTH = 2048
@@ -104,6 +104,51 @@ def _config(*, include_async_training: bool = True) -> Any:
     if include_async_training:
         config["async_training"] = {"partial_rollout": True}
     return OmegaConf.create(config)
+
+
+def _prepare_distillation_rollout_logprobs(config: Any) -> None:
+    manager = object.__new__(LLMServerManager)
+    manager.config = config
+    manager.rollout_config = config.actor_rollout_ref.rollout
+    LLMServerManager._prepare_distillation_rollout_logprobs(manager)
+
+
+def _reverse_kl_topk_config(*, max_logprobs: int | None = None) -> Any:
+    vllm_kwargs = {}
+    if max_logprobs is not None:
+        vllm_kwargs["max_logprobs"] = max_logprobs
+    return OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "engine_kwargs": {"vllm": vllm_kwargs},
+                }
+            },
+            "distillation": {
+                "enabled": True,
+                "distillation_loss": {
+                    "loss_mode": "reverse_kl_topk",
+                    "topk": 128,
+                },
+            },
+        }
+    )
+
+
+def test_reverse_kl_topk_sets_rollout_max_logprobs_for_student_support():
+    config = _reverse_kl_topk_config()
+
+    _prepare_distillation_rollout_logprobs(config)
+
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm.max_logprobs == 128
+
+
+def test_reverse_kl_topk_rejects_too_small_rollout_max_logprobs():
+    config = _reverse_kl_topk_config(max_logprobs=32)
+
+    with pytest.raises(ValueError, match="actor rollout vLLM max_logprobs"):
+        _prepare_distillation_rollout_logprobs(config)
 
 
 async def _generate(config: Any, prompt_len: int, sampling_params: dict[str, Any]) -> TokenOutput:

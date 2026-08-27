@@ -25,8 +25,7 @@ distillation_loss:
 
   # If distillation loss requires top-k logits, this is the value of k.
   # For forward_kl_topk, this is the teacher top-k request/support size.
-  # For reverse_kl_topk, this is the student top-k support size by default;
-  # teacher full-vocab logprobs are requested automatically.
+  # For reverse_kl_topk, this is the student top-k support size.
   topk: 32
 
   # Whether to include task rewards alongside distillation loss.

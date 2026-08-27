@@ -20,10 +20,11 @@ import os
 import platform
 import signal
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
+import numpy as np
 import torch
 from vllm.outputs import RequestOutput
 
@@ -42,6 +43,7 @@ VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
 VLLM_ASCEND_REQUIRED_ENV_VARS = {"VLLM_ALL2ALL_BACKEND": "flashinfer_all2allv", "VLLM_ASCEND_ENABLE_NZ": "0"}
+_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG = "prompt_logprob_token_ids"
 
 
 def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config: Any) -> int:
@@ -124,6 +126,346 @@ def monkey_patch_compute_logits(model, vocab_size: int, banned_token_ids: Option
         return logits
 
     model.compute_logits = MethodType(compute_logits, model)
+
+
+def _get_prompt_logprob_token_ids(sampling_params: Any) -> Any:
+    extra_args = getattr(sampling_params, "extra_args", None) or {}
+    return extra_args.get(_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG)
+
+
+def _to_cpu_target_ids(token_ids: Any) -> torch.Tensor:
+    return torch.as_tensor(token_ids, dtype=torch.int64, device="cpu")
+
+
+def _validate_target_ids(target_ids: torch.Tensor, prompt_len: int, topk: int, req_id: str) -> torch.Tensor:
+    if target_ids.ndim != 2:
+        raise RuntimeError(f"{_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG} for request {req_id} must be 2D.")
+    if target_ids.shape[0] != prompt_len:
+        raise RuntimeError(
+            f"{_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG} for request {req_id} has {target_ids.shape[0]} rows, "
+            f"expected prompt length {prompt_len}."
+        )
+    if target_ids.shape[1] < topk:
+        raise RuntimeError(
+            f"{_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG} for request {req_id} has width {target_ids.shape[1]}, "
+            f"expected at least {topk}."
+        )
+    return target_ids[:, :topk]
+
+
+def _compute_prompt_logprobs_for_token_ids(
+    prompt_token_ids: torch.Tensor,
+    target_token_ids: torch.Tensor,
+    prompt_hidden_states: torch.Tensor,
+    logits_fn: Callable[[torch.Tensor], torch.Tensor],
+    num_prompt_logprobs: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    chunk_size = 1024
+    token_ids, logprobs, ranks = [], [], []
+    prompt_token_ids = prompt_token_ids.to(torch.int64)
+    target_token_ids = target_token_ids.to(torch.int64)
+    for start_idx in range(0, prompt_token_ids.shape[0], chunk_size):
+        end_idx = start_idx + chunk_size
+        logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+        sampled_ids = prompt_token_ids[start_idx:end_idx].to(logits.device, non_blocking=True).unsqueeze(-1)
+        requested_ids = target_token_ids[start_idx:end_idx].to(logits.device, non_blocking=True)
+        logprob_token_ids = torch.cat((sampled_ids, requested_ids), dim=-1)
+        token_ids.append(logprob_token_ids)
+        logprobs.append(compute_token_logprobs(logits, logprob_token_ids))
+        ranks.append(
+            torch.full(
+                (logprob_token_ids.shape[0],),
+                num_prompt_logprobs + 1,
+                dtype=torch.int64,
+                device=logprob_token_ids.device,
+            )
+        )
+
+    token_ids = torch.cat(token_ids, dim=0) if len(token_ids) > 1 else token_ids[0]
+    logprobs = torch.cat(logprobs, dim=0) if len(logprobs) > 1 else logprobs[0]
+    ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
+    return token_ids, logprobs, ranks
+
+
+def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
+    if worker is None or getattr(worker, "_verl_target_prompt_logprobs_patched", False):
+        return
+
+    original_add_request = worker.add_request
+    original_remove_request = worker.remove_request
+    original_compute_prompt_logprobs = worker.compute_prompt_logprobs
+    worker._verl_prompt_logprob_token_ids = {}
+
+    def add_request(self, req_id: str, req_idx: int, sampling_params: Any):
+        original_add_request(req_id, req_idx, sampling_params)
+        target_ids = _get_prompt_logprob_token_ids(sampling_params)
+        if target_ids is not None:
+            self._verl_prompt_logprob_token_ids[req_id] = _to_cpu_target_ids(target_ids)
+
+    def remove_request(self, req_id: str) -> None:
+        self._verl_prompt_logprob_token_ids.pop(req_id, None)
+        original_remove_request(req_id)
+
+    def compute_prompt_logprobs(
+        self,
+        logits_fn: Callable[[torch.Tensor], torch.Tensor],
+        hidden_states: torch.Tensor,
+        input_batch: Any,
+        all_token_ids: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+        prompt_lens: np.ndarray,
+        prefill_lens: np.ndarray,
+        num_computed_prefill_tokens: np.ndarray,
+    ) -> dict[str, Any]:
+        prompt_lens_all = prompt_lens
+        prefill_lens_all = prefill_lens
+        num_computed_prefill_tokens_all = num_computed_prefill_tokens
+        idx_mapping_np = input_batch.idx_mapping_np
+        needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
+        if not np.any(needs_prompt_logprobs):
+            return {}
+
+        num_prompt_logprobs = self.num_prompt_logprobs[idx_mapping_np]
+        prompt_lens = prompt_lens[idx_mapping_np]
+        computed_prefill = num_computed_prefill_tokens[idx_mapping_np]
+        includes_prompt = computed_prefill < prompt_lens
+        resumed_after_prompt = prompt_lens < prefill_lens[idx_mapping_np]
+        needs_prompt_logprobs &= includes_prompt & ~resumed_after_prompt
+        if not np.any(needs_prompt_logprobs):
+            return {}
+
+        targeted_reqs = [
+            req_id
+            for i, req_id in enumerate(input_batch.req_ids)
+            if needs_prompt_logprobs[i] and req_id in self._verl_prompt_logprob_token_ids
+        ]
+        if not targeted_reqs:
+            return original_compute_prompt_logprobs(
+                logits_fn,
+                hidden_states,
+                input_batch,
+                all_token_ids,
+                num_computed_tokens,
+                prompt_lens_all,
+                prefill_lens_all,
+                num_computed_prefill_tokens_all,
+            )
+
+        missing_reqs = [
+            req_id
+            for i, req_id in enumerate(input_batch.req_ids)
+            if needs_prompt_logprobs[i] and req_id not in self._verl_prompt_logprob_token_ids
+        ]
+        if missing_reqs:
+            raise RuntimeError(f"Cannot mix targeted and regular prompt logprobs in one vLLM batch: {missing_reqs}.")
+
+        requested_num_prompt_logprobs = num_prompt_logprobs[needs_prompt_logprobs]
+        if np.any(requested_num_prompt_logprobs <= 0):
+            raise RuntimeError("Targeted prompt logprobs require prompt_logprobs > 0.")
+        max_num_prompt_logprobs = int(requested_num_prompt_logprobs.max())
+
+        from vllm.v1.outputs import LogprobsTensors
+        from vllm.v1.worker.gpu.sample.prompt_logprob import get_prompt_logprobs_token_ids
+
+        target_token_ids = torch.zeros(
+            (input_batch.num_tokens, max_num_prompt_logprobs),
+            dtype=torch.int64,
+            device=hidden_states.device,
+        )
+        query_start_loc_np = input_batch.query_start_loc_np
+        for i, req_id in enumerate(input_batch.req_ids):
+            if not needs_prompt_logprobs[i]:
+                continue
+            req_topk = int(num_prompt_logprobs[i])
+            req_target_ids = _validate_target_ids(
+                self._verl_prompt_logprob_token_ids[req_id],
+                prompt_len=int(prompt_lens[i]),
+                topk=req_topk,
+                req_id=req_id,
+            )
+            start_idx = int(query_start_loc_np[i])
+            end_idx = int(query_start_loc_np[i + 1])
+            token_offset = int(computed_prefill[i])
+            rows = req_target_ids[token_offset : token_offset + end_idx - start_idx]
+            target_token_ids[start_idx:end_idx, :req_topk] = rows.to(hidden_states.device, non_blocking=True)
+
+        prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
+            input_batch.num_tokens,
+            input_batch.query_start_loc,
+            input_batch.idx_mapping,
+            num_computed_tokens,
+            all_token_ids,
+        )
+        prompt_token_ids, prompt_logprobs, prompt_ranks = _compute_prompt_logprobs_for_token_ids(
+            prompt_logprobs_token_ids,
+            target_token_ids,
+            hidden_states[: input_batch.num_tokens],
+            logits_fn,
+            max_num_prompt_logprobs,
+        )
+
+        pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
+        is_prompt_chunked = pos_after_step < prompt_lens
+
+        prompt_logprobs_dict = {}
+        for i, req_id in enumerate(input_batch.req_ids):
+            if not needs_prompt_logprobs[i]:
+                continue
+
+            req_is_prompt_chunked = is_prompt_chunked[i]
+            req_num_prompt_logprobs = int(num_prompt_logprobs[i])
+            start_idx = int(query_start_loc_np[i])
+            end_idx = int(query_start_loc_np[i + 1])
+            if not req_is_prompt_chunked:
+                end_idx -= 1
+
+            width = req_num_prompt_logprobs + 1
+            logprobs = (
+                None
+                if start_idx >= end_idx
+                else LogprobsTensors(
+                    logprob_token_ids=prompt_token_ids[start_idx:end_idx, :width],
+                    logprobs=prompt_logprobs[start_idx:end_idx, :width],
+                    selected_token_ranks=prompt_ranks[start_idx:end_idx],
+                )
+            )
+
+            prompt_logprobs_list = self.in_progress_prompt_logprobs[req_id]
+            if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
+                prompt_logprobs_list.append(logprobs)
+            if req_is_prompt_chunked:
+                continue
+
+            if prompt_logprobs_list:
+                logprobs = LogprobsTensors(
+                    logprob_token_ids=torch.cat([x.logprob_token_ids for x in prompt_logprobs_list]),
+                    logprobs=torch.cat([x.logprobs for x in prompt_logprobs_list]),
+                    selected_token_ranks=torch.cat([x.selected_token_ranks for x in prompt_logprobs_list]),
+                )
+                prompt_logprobs_list.clear()
+
+            if logprobs is not None:
+                prompt_logprobs_dict[req_id] = logprobs
+                self._verl_prompt_logprob_token_ids.pop(req_id, None)
+        return prompt_logprobs_dict
+
+    worker.add_request = MethodType(add_request, worker)
+    worker.remove_request = MethodType(remove_request, worker)
+    worker.compute_prompt_logprobs = MethodType(compute_prompt_logprobs, worker)
+    worker._verl_target_prompt_logprobs_patched = True
+
+
+def _patch_v1_model_runner_prompt_logprobs(model_runner: Any) -> None:
+    if getattr(model_runner, "_verl_target_prompt_logprobs_patched", False) or not hasattr(
+        model_runner, "_get_prompt_logprobs_dict"
+    ):
+        return
+
+    original_get_prompt_logprobs_dict = model_runner._get_prompt_logprobs_dict
+
+    def _get_prompt_logprobs_dict(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+    ) -> dict[str, Any]:
+        if not self.num_prompt_logprobs:
+            return {}
+
+        has_targeted_req = False
+        for req_id in self.num_prompt_logprobs:
+            if (
+                req_id in num_scheduled_tokens
+                and _get_prompt_logprob_token_ids(self.requests[req_id].sampling_params) is not None
+            ):
+                has_targeted_req = True
+                break
+        if not has_targeted_req:
+            return original_get_prompt_logprobs_dict(hidden_states, num_scheduled_tokens)
+
+        from vllm.v1.outputs import LogprobsTensors
+
+        prompt_logprobs_dict = {}
+        completed_prefill_reqs = []
+        for req_id, num_prompt_logprobs in self.num_prompt_logprobs.items():
+            num_tokens = num_scheduled_tokens.get(req_id)
+            if num_tokens is None:
+                continue
+
+            request = self.requests[req_id]
+            if request.prompt_token_ids is None:
+                continue
+
+            num_prompt_tokens = len(request.prompt_token_ids)
+            prompt_token_ids = torch.tensor(request.prompt_token_ids).to(self.device, non_blocking=True)
+
+            logprobs_tensors = request.in_progress_prompt_logprobs_cpu
+            if logprobs_tensors is None:
+                logprobs_tensors = LogprobsTensors.empty_cpu(num_prompt_tokens - 1, num_prompt_logprobs + 1)
+                request.in_progress_prompt_logprobs_cpu = logprobs_tensors
+
+            start_idx = request.num_computed_tokens
+            start_tok = start_idx + 1
+            num_remaining_tokens = num_prompt_tokens - start_tok
+            if num_tokens <= num_remaining_tokens:
+                num_logits = num_tokens
+            else:
+                num_logits = num_remaining_tokens
+                completed_prefill_reqs.append(req_id)
+                prompt_logprobs_dict[req_id] = logprobs_tensors
+
+            if num_logits <= 0:
+                continue
+
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            offset = self.query_start_loc.np[req_idx].item()
+            prompt_hidden_states = hidden_states[offset : offset + num_logits]
+
+            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            target_ids = _get_prompt_logprob_token_ids(request.sampling_params)
+            if target_ids is None:
+                logits = self.model.compute_logits(prompt_hidden_states)
+                logprobs = self.sampler.compute_logprobs(logits)
+                token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
+                    logprobs, num_prompt_logprobs, tgt_token_ids
+                )
+            else:
+                target_ids = _validate_target_ids(
+                    _to_cpu_target_ids(target_ids),
+                    prompt_len=num_prompt_tokens,
+                    topk=num_prompt_logprobs,
+                    req_id=req_id,
+                )
+                token_ids, logprobs, ranks = _compute_prompt_logprobs_for_token_ids(
+                    tgt_token_ids,
+                    target_ids[start_idx : start_idx + num_logits].to(self.device, non_blocking=True),
+                    prompt_hidden_states,
+                    self.model.compute_logits,
+                    num_prompt_logprobs,
+                )
+
+            chunk_slice = slice(start_idx, start_idx + num_logits)
+            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(token_ids, non_blocking=True)
+            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(ranks, non_blocking=True)
+
+        for req_id in completed_prefill_reqs:
+            del self.num_prompt_logprobs[req_id]
+            self.requests[req_id].in_progress_prompt_logprobs_cpu = None
+
+        if prompt_logprobs_dict:
+            self._sync_device()
+
+        return prompt_logprobs_dict
+
+    model_runner._get_prompt_logprobs_dict = MethodType(_get_prompt_logprobs_dict, model_runner)
+    model_runner._verl_target_prompt_logprobs_patched = True
+
+
+def patch_prompt_logprob_target_ids(model_runner: Any) -> None:
+    _patch_v2_prompt_logprobs_worker(getattr(model_runner, "prompt_logprobs_worker", None))
+    _patch_v1_model_runner_prompt_logprobs(model_runner)
 
 
 class vLLMColocateWorkerExtension:
@@ -225,6 +567,7 @@ class vLLMColocateWorkerExtension:
                 yield self._get_drafter_model(), draft_cfg
 
     def monkey_patch_model(self, vocab_size: int, banned_token_ids: Optional[list[int]] = None):
+        patch_prompt_logprob_target_ids(self.model_runner)
         for model in self._iter_all_models():
             # patch compute_logits to avoid sampling OOV and other illegal tokens
             monkey_patch_compute_logits(model, vocab_size, banned_token_ids)

@@ -294,15 +294,38 @@ def test_reverse_kl_topk_uses_student_topk_and_full_teacher_logprobs():
     torch.testing.assert_close(output["teacher_mass"], teacher_on_student_topk.exp().sum(dim=-1))
 
 
-def test_reverse_kl_topk_requires_full_teacher_payload():
+def test_reverse_kl_topk_accepts_targeted_teacher_logprobs():
     logits = torch.tensor([[[3.0, 1.0, 2.0, 0.0]]], dtype=torch.float32)
-    teacher_ids = _nested_from_rows([[0, 2]]).to(torch.int64)
-    teacher_logprobs = _nested_from_rows([[torch.log(torch.tensor(0.5)), torch.log(torch.tensor(0.2))]]).to(
-        torch.float32
-    )
     config = SimpleNamespace(distillation_loss=SimpleNamespace(topk=2, log_prob_min_clamp=None, use_chunked_topk=False))
 
-    with pytest.raises(ValueError, match="full-vocab teacher log-prob payload"):
+    student_log_probs = torch.log_softmax(logits, dim=-1)
+    student_topk_log_probs, student_topk_ids = torch.topk(student_log_probs, k=2, dim=-1)
+    teacher_full_logprobs = torch.log(torch.tensor([[[0.2, 0.1, 0.5, 0.2]]], dtype=torch.float32))
+    teacher_on_student_topk = torch.gather(teacher_full_logprobs, dim=-1, index=student_topk_ids)
+
+    output = compute_fsdp_reverse_kl_topk(
+        student_logits=logits,
+        teacher_topk_log_probs=_nested_from_rows(teacher_on_student_topk.squeeze(0).tolist()).to(torch.float32),
+        teacher_topk_ids=_nested_from_rows(student_topk_ids.squeeze(0).tolist()).to(torch.int64),
+        config=config,
+        data_format="thd",
+    )
+
+    expected_loss = (student_topk_log_probs.exp() * (student_topk_log_probs - teacher_on_student_topk)).sum(dim=-1)
+    torch.testing.assert_close(output["distillation_losses"], expected_loss)
+    torch.testing.assert_close(output["student_mass"], student_topk_log_probs.exp().sum(dim=-1))
+    torch.testing.assert_close(output["teacher_mass"], teacher_on_student_topk.exp().sum(dim=-1))
+
+
+def test_reverse_kl_topk_rejects_non_targeted_partial_teacher_payload():
+    logits = torch.tensor([[[3.0, 1.0, 2.0, 0.0]]], dtype=torch.float32)
+    teacher_ids = _nested_from_rows([[0, 2, 3]]).to(torch.int64)
+    teacher_logprobs = _nested_from_rows(
+        [[torch.log(torch.tensor(0.5)), torch.log(torch.tensor(0.2)), torch.log(torch.tensor(0.1))]]
+    ).to(torch.float32)
+    config = SimpleNamespace(distillation_loss=SimpleNamespace(topk=2, log_prob_min_clamp=None, use_chunked_topk=False))
+
+    with pytest.raises(ValueError, match="requires either teacher log-probs on the student top-k support"):
         compute_fsdp_reverse_kl_topk(
             student_logits=logits,
             teacher_topk_log_probs=teacher_logprobs,
@@ -312,7 +335,7 @@ def test_reverse_kl_topk_requires_full_teacher_payload():
         )
 
 
-def test_reverse_kl_topk_teacher_sampling_requests_full_vocab():
+def test_reverse_kl_topk_teacher_sampling_requires_target_ids():
     teacher_config = SimpleNamespace(inference=SimpleNamespace(temperature=1.0), get_vocab_size=lambda: 7)
     loss_config = SimpleNamespace(
         loss_mode="reverse_kl_topk",
@@ -320,9 +343,25 @@ def test_reverse_kl_topk_teacher_sampling_requests_full_vocab():
         loss_settings=SimpleNamespace(use_topk=True),
     )
 
-    sampling_params = _get_teacher_sampling_params(teacher_config, loss_config)
+    with pytest.raises(ValueError, match="student top-k target token ids"):
+        _get_teacher_sampling_params(teacher_config, loss_config)
 
-    assert sampling_params["prompt_logprobs"] == 7
+
+def test_reverse_kl_topk_teacher_sampling_can_request_targeted_ids():
+    teacher_config = SimpleNamespace(inference=SimpleNamespace(temperature=1.0), get_vocab_size=lambda: 7)
+    loss_config = SimpleNamespace(
+        loss_mode="reverse_kl_topk",
+        topk=2,
+        loss_settings=SimpleNamespace(use_topk=True),
+    )
+    target_ids = torch.tensor([[1, 2], [3, 4], [0, 0]], dtype=torch.int32)
+
+    sampling_params = _get_teacher_sampling_params(teacher_config, loss_config, target_token_ids=target_ids)
+
+    assert sampling_params["prompt_logprobs"] == 2
+    assert sampling_params["detokenize"] is False
+    assert sampling_params["flat_logprobs"] is True
+    assert sampling_params["extra_args"]["prompt_logprob_token_ids"] == target_ids.tolist()
 
 
 def test_teacher_vocab_size_cache_is_mutable(monkeypatch):

@@ -165,11 +165,10 @@ def compute_reverse_kl_topk(
     config: DistillationConfig,
     data_format: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute reverse KL on the student's top-k support using full teacher log-probs.
+    """Compute reverse KL on the student's top-k support.
 
-    This first implementation intentionally uses a naive full-vocab teacher
-    log-prob payload. It densifies the teacher log-probs, selects the student
-    top-k support, and gathers the teacher log-probs at those student ids.
+    The preferred payload is teacher log-probs already gathered on the student
+    top-k ids. A full-vocab teacher payload is still accepted for compatibility.
     """
     assert teacher_topk_log_probs.is_nested and teacher_topk_ids.is_nested
     teacher_topk_log_probs = teacher_topk_log_probs.values().unsqueeze(0)  # (1, total_nnz, vocab_size)
@@ -185,20 +184,35 @@ def compute_reverse_kl_topk(
     if student_topk is None:
         raise ValueError("reverse_kl_topk requires distillation_loss.topk.")
 
-    vocab_size = student_logits.shape[-1]
-    if teacher_topk_ids.shape[-1] < vocab_size:
-        raise ValueError(
-            "reverse_kl_topk currently requires a full-vocab teacher log-prob payload, "
-            f"but got {teacher_topk_ids.shape[-1]} teacher entries for vocab size {vocab_size}."
-        )
+    use_chunked_topk = getattr(loss_config, "use_chunked_topk", False)
+    if teacher_topk_ids.shape[-1] == student_topk:
+        student_topk_ids = teacher_topk_ids.long()
+        if use_chunked_topk:
+            student_topk_log_probs = _chunked_topk_log_probs(
+                student_logits,
+                student_topk_ids,
+                chunk_size=getattr(loss_config, "chunked_topk_chunk_size", 4096),
+            )
+        else:
+            student_log_probs = F.log_softmax(student_logits, dim=-1)
+            student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=student_topk_ids)
+        teacher_log_probs_on_student_topk = teacher_topk_log_probs
+    else:
+        vocab_size = student_logits.shape[-1]
+        if teacher_topk_ids.shape[-1] < vocab_size:
+            raise ValueError(
+                "reverse_kl_topk requires either teacher log-probs on the student top-k support "
+                "or a full-vocab teacher log-prob payload, "
+                f"but got {teacher_topk_ids.shape[-1]} teacher entries for vocab size {vocab_size}."
+            )
 
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    student_topk_log_probs, student_topk_ids = torch.topk(student_log_probs, k=student_topk, dim=-1)
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        student_topk_log_probs, student_topk_ids = torch.topk(student_log_probs, k=student_topk, dim=-1)
 
-    fill_value = torch.finfo(teacher_topk_log_probs.dtype).min
-    teacher_log_probs = torch.full_like(student_log_probs, fill_value)
-    teacher_log_probs.scatter_(dim=-1, index=teacher_topk_ids.long(), src=teacher_topk_log_probs)
-    teacher_log_probs_on_student_topk = torch.gather(teacher_log_probs, dim=-1, index=student_topk_ids)
+        fill_value = torch.finfo(teacher_topk_log_probs.dtype).min
+        teacher_log_probs = torch.full_like(student_log_probs, fill_value)
+        teacher_log_probs.scatter_(dim=-1, index=teacher_topk_ids.long(), src=teacher_topk_log_probs)
+        teacher_log_probs_on_student_topk = torch.gather(teacher_log_probs, dim=-1, index=student_topk_ids)
 
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_log_probs_on_student_topk.exp().sum(dim=-1)

@@ -276,7 +276,7 @@ Distillation divergence to use. Default: `"k3"`.
 
 Two registered families:
 
-- **Top-k** (`forward_kl_topk`, `reverse_kl_topk`): distributional KL losses on a truncated support. `forward_kl_topk` uses the teacher's top-k support. `reverse_kl_topk` uses the student's top-k support by default and currently requires full-vocab teacher logprobs; this initial implementation does not expose separate support-specific mode names.
+- **Top-k** (`forward_kl_topk`, `reverse_kl_topk`): distributional KL losses on a truncated support. `forward_kl_topk` uses the teacher's top-k support. `reverse_kl_topk` uses the student's top-k support.
 - **Single-sample KL estimators** (`kl`, `k1`, `abs`, `mse`, `k2`,
   `low_var_kl`, `k3`): per-token Monte Carlo estimators of reverse KL
   computed from the student's `log_probs` and the teacher's single
@@ -289,7 +289,7 @@ Two registered families:
 Only used when `loss_mode` requires top-$k$. For `forward_kl_topk`, it drives both
 the teacher's `prompt_logprobs` request size and (for vLLM) the engine's
 `max_logprobs` cap. For `reverse_kl_topk`, it is the student support size by
-default; the teacher request uses the teacher model's full vocabulary size.
+default; the teacher request returns logprobs only for those student support ids.
 
 ### `distillation.distillation_loss.use_task_rewards` (bool)
 
@@ -666,8 +666,10 @@ rollouts on other samples.
    sampling params with `max_tokens=1` plus `prompt_logprobs=topk` (or `0`),
    so the teacher computes logprobs for the (prompt + response) sequence rather than
    generating new tokens. `topk` is set to `distillation.distillation_loss.topk`
-   for `forward_kl_topk`, the teacher model's full vocabulary size for
-   `reverse_kl_topk`, and `0` otherwise (single-sample logprob only).
+   for `forward_kl_topk` and `reverse_kl_topk`, and `0` otherwise
+   (single-sample logprob only). For `reverse_kl_topk`, Verl first computes the
+   student's top-$k$ support and asks the vLLM teacher to gather logprobs only on
+   those token ids.
 
    **Temperature is always forced to `1.0`** regardless of the configured value.
    `prompt_logprobs` is computed via a forward pass over the existing (prompt + response)
@@ -712,7 +714,8 @@ Using the `DataProto` produced by the Agent Loop (rollouts + teacher logprobs in
    the `student_logits is not None` branch of `distillation_ppo_loss`. The
    logits-processor branch dispatches to the selected top-$k$ loss, which has a
    separate implementation per training engine. `reverse_kl_topk` is currently
-   implemented for FSDP/VeOmni only, using the student's top-$k$ support. Per-token
+   implemented for FSDP/VeOmni only, using teacher logprobs gathered on the
+   student's top-$k$ support. Per-token
    `distillation_losses`, `student_mass`, `teacher_mass`, and optional overlap
    tensors are written back into `model_output` so the full logits can be freed
    before the final loss step. The overlap tensors are used only for logging.

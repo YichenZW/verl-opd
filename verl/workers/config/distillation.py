@@ -293,14 +293,9 @@ class DistillationConfig(BaseConfig):
         self.teacher_models = self._resolve_teacher_models()
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
-            teacher_logprob_topk = (
-                teacher_model.get_vocab_size()
-                if self.distillation_loss.loss_mode == "reverse_kl_topk"
-                else self.distillation_loss.topk
-            )
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
-                topk=teacher_logprob_topk,
+                topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

@@ -31,10 +31,13 @@ from verl.workers.rollout.llm_server import LLMServerClient
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
+_PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG = "prompt_logprob_token_ids"
+
 
 def _get_teacher_sampling_params(
     teacher_model_config: DistillationTeacherModelConfig,
     distillation_loss_config: DistillationLossConfig,
+    target_token_ids: Optional[Any] = None,
 ) -> dict[str, Any]:
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
     # Temperature has no effect on prompt_logprobs: the teacher performs a forward pass over
@@ -51,14 +54,25 @@ def _get_teacher_sampling_params(
     if not distillation_loss_config.loss_settings.use_topk:
         num_logprobs = 0
     elif distillation_loss_config.loss_mode == "reverse_kl_topk":
-        num_logprobs = teacher_model_config.get_vocab_size()
+        if target_token_ids is None:
+            raise ValueError("reverse_kl_topk teacher logprob requests require student top-k target token ids.")
+        num_logprobs = distillation_loss_config.topk
     else:
         num_logprobs = distillation_loss_config.topk
-    return {
+    sampling_params = {
         "max_tokens": 1,
         "temperature": 1.0,
         "prompt_logprobs": num_logprobs,
     }
+    if target_token_ids is not None:
+        sampling_params["detokenize"] = False
+        sampling_params["flat_logprobs"] = True
+        sampling_params["extra_args"] = {
+            _PROMPT_LOGPROB_TOKEN_IDS_EXTRA_ARG: (
+                target_token_ids.tolist() if isinstance(target_token_ids, torch.Tensor) else target_token_ids
+            )
+        }
+    return sampling_params
 
 
 def _pad_teacher_outputs(
@@ -123,6 +137,7 @@ class AsyncTeacherLLMServerManager:
         multi_modal_data: Optional[dict[str, Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        target_token_ids: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -132,7 +147,11 @@ class AsyncTeacherLLMServerManager:
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
-            sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
+            sampling_params=_get_teacher_sampling_params(
+                teacher_model_config,
+                self.distillation_loss_config,
+                target_token_ids=target_token_ids,
+            ),
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
             audio_data=multi_modal_data.get("audios"),
@@ -143,4 +162,11 @@ class AsyncTeacherLLMServerManager:
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        if target_token_ids is not None:
+            expected_ids = torch.as_tensor(target_token_ids, dtype=teacher_ids.dtype, device=teacher_ids.device)
+            if expected_ids.shape != teacher_ids.shape or not torch.equal(expected_ids, teacher_ids):
+                raise RuntimeError(
+                    "Teacher server did not return logprobs for the requested student top-k token ids. "
+                    "This usually means the vLLM targeted prompt-logprob adapter was not installed."
+                )
         return teacher_ids, teacher_logprobs

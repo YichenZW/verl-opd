@@ -492,6 +492,7 @@ class LLMServerManager:
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
         self.model_config = config.actor_rollout_ref.model
+        self._prepare_distillation_rollout_logprobs()
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
@@ -596,6 +597,30 @@ class LLMServerManager:
                     self.rollout_config.name,
                     labels=[{"replica": server.replica_rank} for server in self.rollout_replicas],
                 )
+
+    def _prepare_distillation_rollout_logprobs(self) -> None:
+        distillation_config = self.config.get("distillation")
+        if not distillation_config or not distillation_config.get("enabled", False):
+            return
+        loss_config = distillation_config.get("distillation_loss", {})
+        if loss_config.get("loss_mode") != "reverse_kl_topk" or self.rollout_config.name != "vllm":
+            return
+
+        topk = loss_config.get("topk")
+        if topk is None:
+            return
+        engine_kwargs = self.rollout_config.get("engine_kwargs", {})
+        vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}) or {})
+        max_logprobs = vllm_engine_kwargs.get("max_logprobs")
+        if max_logprobs is None:
+            vllm_engine_kwargs["max_logprobs"] = topk
+            engine_kwargs["vllm"] = vllm_engine_kwargs
+            self.rollout_config.engine_kwargs = engine_kwargs
+        elif max_logprobs < topk:
+            raise ValueError(
+                f"actor rollout vLLM max_logprobs ({max_logprobs}) must be >= "
+                f"distillation_loss.topk ({topk}) for reverse_kl_topk."
+            )
 
     async def _init_global_load_balancer(self) -> None:
         load_balancer_cls = self._load_balancer_cls

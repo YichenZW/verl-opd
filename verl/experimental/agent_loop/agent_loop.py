@@ -1008,6 +1008,14 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
+            sequence_ids = prompt_ids + response_ids
+            target_token_ids = None
+            if self.teacher_server_manager.distillation_loss_config.loss_mode == "reverse_kl_topk":
+                target_token_ids = await self._compute_student_topk_ids(
+                    sequence_ids=sequence_ids,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                )
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -1015,13 +1023,49 @@ class AgentLoopWorker:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
-                sequence_ids=prompt_ids + response_ids,
+                sequence_ids=sequence_ids,
                 multi_modal_data=output.multi_modal_data,
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 routing_key=routing_key,
+                target_token_ids=target_token_ids,
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+
+    async def _compute_student_topk_ids(
+        self,
+        sequence_ids: list[int],
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        loss_config = self.teacher_server_manager.distillation_loss_config
+        topk = loss_config.topk
+        if topk is None or topk <= 0:
+            raise ValueError("reverse_kl_topk requires distillation_loss.topk to be a positive integer.")
+
+        multi_modal_data = multi_modal_data or {}
+        student_output = await self.llm_client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=sequence_ids,
+            sampling_params={
+                "max_tokens": 1,
+                "temperature": 1.0,
+                "prompt_logprobs": topk,
+                "detokenize": False,
+                "flat_logprobs": True,
+            },
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+        )
+        student_topk_ids = torch.tensor(student_output.extra_fields["prompt_ids"], dtype=torch.int32)
+        if student_topk_ids.shape != (len(sequence_ids), topk):
+            raise RuntimeError(
+                f"Student top-k ids shape {tuple(student_topk_ids.shape)} does not match "
+                f"expected {(len(sequence_ids), topk)}."
+            )
+        return student_topk_ids
 
     def _postprocess(
         self,
