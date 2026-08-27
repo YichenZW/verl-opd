@@ -159,10 +159,12 @@ def _compute_prompt_logprobs_for_token_ids(
     prompt_hidden_states: torch.Tensor,
     logits_fn: Callable[[torch.Tensor], torch.Tensor],
     num_prompt_logprobs: int,
+    logprobs_mode: str = "raw_logprobs",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
 
     chunk_size = 1024
+    logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     token_ids, logprobs, ranks = [], [], []
     prompt_token_ids = prompt_token_ids.to(torch.int64)
     target_token_ids = target_token_ids.to(torch.int64)
@@ -173,7 +175,10 @@ def _compute_prompt_logprobs_for_token_ids(
         requested_ids = target_token_ids[start_idx:end_idx].to(logits.device, non_blocking=True)
         logprob_token_ids = torch.cat((sampled_ids, requested_ids), dim=-1)
         token_ids.append(logprob_token_ids)
-        logprobs.append(compute_token_logprobs(logits, logprob_token_ids))
+        if logits_mode:
+            logprobs.append(logits.gather(-1, logprob_token_ids).to(torch.float32))
+        else:
+            logprobs.append(compute_token_logprobs(logits, logprob_token_ids))
         ranks.append(
             torch.full(
                 (logprob_token_ids.shape[0],),
@@ -187,6 +192,14 @@ def _compute_prompt_logprobs_for_token_ids(
     logprobs = torch.cat(logprobs, dim=0) if len(logprobs) > 1 else logprobs[0]
     ranks = torch.cat(ranks, dim=0) if len(ranks) > 1 else ranks[0]
     return token_ids, logprobs, ranks
+
+
+def _get_vllm_logprobs_mode(obj: Any) -> str:
+    for source in (obj, getattr(obj, "sampler", None), getattr(obj, "model_config", None)):
+        mode = getattr(source, "logprobs_mode", None)
+        if mode is not None:
+            return mode
+    return "raw_logprobs"
 
 
 def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
@@ -216,12 +229,17 @@ def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
         all_token_ids: torch.Tensor,
         num_computed_tokens: torch.Tensor,
         prompt_lens: np.ndarray,
-        prefill_lens: np.ndarray,
-        num_computed_prefill_tokens: np.ndarray,
+        prefill_lens: Optional[np.ndarray] = None,
+        num_computed_prefill_tokens: Optional[np.ndarray] = None,
     ) -> dict[str, Any]:
         prompt_lens_all = prompt_lens
-        prefill_lens_all = prefill_lens
-        num_computed_prefill_tokens_all = num_computed_prefill_tokens
+        use_input_batch_prefill_state = prefill_lens is None or num_computed_prefill_tokens is None
+        if use_input_batch_prefill_state:
+            prefill_lens_all = input_batch.prefill_len_np
+            num_computed_prefill_tokens_all = input_batch.num_computed_prefill_tokens_np
+        else:
+            prefill_lens_all = prefill_lens
+            num_computed_prefill_tokens_all = num_computed_prefill_tokens
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
         if not np.any(needs_prompt_logprobs):
@@ -229,9 +247,14 @@ def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
 
         num_prompt_logprobs = self.num_prompt_logprobs[idx_mapping_np]
         prompt_lens = prompt_lens[idx_mapping_np]
-        computed_prefill = num_computed_prefill_tokens[idx_mapping_np]
+        if use_input_batch_prefill_state:
+            prefill_lens = prefill_lens_all
+            computed_prefill = num_computed_prefill_tokens_all
+        else:
+            prefill_lens = prefill_lens_all[idx_mapping_np]
+            computed_prefill = num_computed_prefill_tokens_all[idx_mapping_np]
         includes_prompt = computed_prefill < prompt_lens
-        resumed_after_prompt = prompt_lens < prefill_lens[idx_mapping_np]
+        resumed_after_prompt = prompt_lens < prefill_lens
         needs_prompt_logprobs &= includes_prompt & ~resumed_after_prompt
         if not np.any(needs_prompt_logprobs):
             return {}
@@ -242,16 +265,26 @@ def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
             if needs_prompt_logprobs[i] and req_id in self._verl_prompt_logprob_token_ids
         ]
         if not targeted_reqs:
-            return original_compute_prompt_logprobs(
-                logits_fn,
-                hidden_states,
-                input_batch,
-                all_token_ids,
-                num_computed_tokens,
-                prompt_lens_all,
-                prefill_lens_all,
-                num_computed_prefill_tokens_all,
-            )
+            if use_input_batch_prefill_state:
+                return original_compute_prompt_logprobs(
+                    logits_fn,
+                    hidden_states,
+                    input_batch,
+                    all_token_ids,
+                    num_computed_tokens,
+                    prompt_lens_all,
+                )
+            else:
+                return original_compute_prompt_logprobs(
+                    logits_fn,
+                    hidden_states,
+                    input_batch,
+                    all_token_ids,
+                    num_computed_tokens,
+                    prompt_lens_all,
+                    prefill_lens_all,
+                    num_computed_prefill_tokens_all,
+                )
 
         missing_reqs = [
             req_id
@@ -304,6 +337,7 @@ def _patch_v2_prompt_logprobs_worker(worker: Any) -> None:
             hidden_states[: input_batch.num_tokens],
             logits_fn,
             max_num_prompt_logprobs,
+            _get_vllm_logprobs_mode(self),
         )
 
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
@@ -443,6 +477,7 @@ def _patch_v1_model_runner_prompt_logprobs(model_runner: Any) -> None:
                     prompt_hidden_states,
                     self.model.compute_logits,
                     num_prompt_logprobs,
+                    _get_vllm_logprobs_mode(self),
                 )
 
             chunk_slice = slice(start_idx, start_idx + num_logits)
