@@ -276,7 +276,7 @@ Distillation divergence to use. Default: `"k3"`.
 
 Two registered families:
 
-- **Top-k** (`forward_kl_topk`, `reverse_kl_topk`): distributional KL losses on a truncated support. `forward_kl_topk` uses the teacher's top-k support. `reverse_kl_topk` uses the student's top-k support by default and currently requires full-vocab teacher logprobs; this initial implementation does not expose separate support-specific mode names.
+- **Top-k** (`forward_kl_topk`, `reverse_kl_topk`): distributional KL losses on a truncated support. `forward_kl_topk` uses the teacher's top-k support. `reverse_kl_topk` uses the student's top-k support by default and currently requires full-vocab teacher logprobs.
 - **Single-sample KL estimators** (`kl`, `k1`, `abs`, `mse`, `k2`,
   `low_var_kl`, `k3`): per-token Monte Carlo estimators of reverse KL
   computed from the student's `log_probs` and the teacher's single
